@@ -1,0 +1,143 @@
+name: Probar Copilot cloud agent con GPT-5.4
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Instrucción para el agente"
+        required: false
+        default: "Crea o actualiza el archivo data/gpt54_probe.txt con una frase motivadora original en español y añade la fecha actual. Haz los cambios en una rama y abre una pull request."
+      model:
+        description: "Modelo del agente"
+        required: false
+        default: "gpt-5.4"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lanzar tarea del agente
+        id: create_task
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PROMPT: ${{ inputs.prompt }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+
+          body=$(python - <<'PY'
+          import json, os
+          print(json.dumps({
+            "prompt": os.environ["PROMPT"],
+            "model": os.environ["MODEL"],
+            "create_pull_request": True,
+            "base_ref": "main"
+          }))
+          PY
+          )
+
+          http_code=$(curl -sS -o task_create.json -w "%{http_code}" \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/agents/repos/${OWNER}/${REPO}/tasks \
+            -d "$body")
+
+          echo "HTTP status: ${http_code}"
+          cat task_create.json
+          echo
+
+          if [ "$http_code" != "201" ]; then
+            echo "La creación de la tarea falló."
+            echo "Comprueba plan/políticas de Copilot cloud agent y permisos reales del token."
+            exit 1
+          fi
+
+          task_id=$(python - <<'PY'
+          import json
+          with open('task_create.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          print(data["id"])
+          PY
+          )
+
+          task_url=$(python - <<'PY'
+          import json
+          with open('task_create.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          print(data.get("html_url", ""))
+          PY
+          )
+
+          echo "task_id=${task_id}" >> "$GITHUB_OUTPUT"
+          echo "task_url=${task_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Esperar resultado
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          TASK_ID: ${{ steps.create_task.outputs.task_id }}
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 30); do
+            http_code=$(curl -sS -o task_status.json -w "%{http_code}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              https://api.github.com/agents/repos/${OWNER}/${REPO}/tasks/${TASK_ID})
+
+            echo "Polling ${i}/30 - HTTP ${http_code}"
+            cat task_status.json
+            echo
+
+            if [ "$http_code" != "200" ]; then
+              echo "No se pudo consultar el estado de la tarea."
+              exit 1
+            fi
+
+            state=$(python - <<'PY'
+            import json
+            with open('task_status.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            print(data.get("state", "unknown"))
+            PY
+            )
+
+            echo "Estado actual: ${state}"
+
+            case "$state" in
+              completed)
+                echo "Tarea completada."
+                exit 0
+                ;;
+              failed|timed_out|cancelled)
+                echo "La tarea terminó en estado ${state}."
+                exit 1
+                ;;
+              waiting_for_user)
+                echo "La tarea necesita intervención manual."
+                exit 1
+                ;;
+              *)
+                sleep 20
+                ;;
+            esac
+          done
+
+          echo "Timeout esperando a la tarea."
+          exit 1
+
+      - name: Resumen
+        if: always()
+        run: |
+          echo "Task URL: ${{ steps.create_task.outputs.task_url }}"
+          echo "Si salió bien, revisa si el agente abrió una PR."
